@@ -836,7 +836,13 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         }
 
         let mut structure = Structure::builder("wayland.src");
-        for (key, var) in display.env_vars().flat_map(|var| var.split_once("=")) {
+        let Ok(env_vars) = display.env_vars() else {
+            return Err(gst::error_msg!(
+                LibraryError::Init,
+                ("The compositor failed to start, see the log for the cause.")
+            ));
+        };
+        for (key, var) in env_vars.flat_map(|var| var.split_once("=")) {
             structure = structure.field(key, var);
         }
         let structure = structure.build();
