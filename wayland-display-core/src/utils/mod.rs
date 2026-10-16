@@ -23,7 +23,8 @@ pub mod tests {
 
     /// A render node whose kernel driver is one of `drivers`, for hardware-gated
     /// tests -- so they target the right GPU on a multi-GPU host instead of a
-    /// hardcoded `renderD12x` that may be a different vendor.
+    /// hardcoded `renderD12x` that may be a different vendor. Only nodes this process can
+    /// open read-write are returned.
     #[cfg(test)]
     pub fn pick_render_node(drivers: &[&str]) -> Option<DrmNode> {
         for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
@@ -38,8 +39,16 @@ pub mod tests {
                         .find_map(|l| l.strip_prefix("DRIVER=").map(str::to_owned))
                 })
                 .unwrap_or_default();
-            if drivers.iter().any(|d| *d == drv) {
-                if let Ok(node) = DrmNode::from_path(format!("/dev/dri/{name}")) {
+            let path = format!("/dev/dri/{name}");
+            // Skip nodes this process can't open (e.g. not in the `render` group): EGL init
+            // on them panics and poisons the shared EGL display cache for later tests.
+            let usable = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .is_ok();
+            if usable && drivers.iter().any(|d| *d == drv) {
+                if let Ok(node) = DrmNode::from_path(&path) {
                     return Some(node);
                 }
             }

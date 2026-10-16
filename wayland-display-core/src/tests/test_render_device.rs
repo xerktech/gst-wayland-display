@@ -53,8 +53,8 @@ fn software_render_target_has_no_render_device() {
 #[test]
 #[ignore = "needs a GPU render node; run via ci/harness.sh gpu"]
 fn hardware_render_target_resolves_its_render_device() {
-    // A node the compositor can actually render on: a failed EGL init would poison the shared
-    // EGL_DISPLAYS lock and fail unrelated tests in this process.
+    // Not a hard-coded node: on a missing or unopenable one the compositor's EGL init panics and
+    // poisons the shared EGL display cache, failing unrelated tests in this process.
     let Some(node) = pick_render_node(&["amdgpu", "radeon", "i915", "xe", "nvidia"]) else {
         eprintln!("skip: no GPU render node");
         return;
