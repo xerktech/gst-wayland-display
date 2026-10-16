@@ -11,7 +11,6 @@ use gst_base::subclass::prelude::*;
 use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, VideoInfoDmaDrm};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::ops::DerefMut;
 use std::sync::atomic::AtomicPtr;
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
@@ -32,7 +31,9 @@ use waylanddisplaycore::{
 pub struct WaylandDisplaySrc {
     state: Mutex<Option<State>>,
     settings: Mutex<Settings>,
-    command_tx: Sender<Command>,
+    // The display takes the receiver on start() and drops it on stop(), so the pair is replaced
+    // for each run; send through send_command(), never a cloned sender.
+    command_tx: Mutex<Sender<Command>>,
     command_rx: Mutex<Option<Channel<Command>>>,
 }
 
@@ -42,9 +43,22 @@ impl Default for WaylandDisplaySrc {
         WaylandDisplaySrc {
             state: Mutex::new(None),
             settings: Mutex::new(Settings::default()),
-            command_tx,
+            command_tx: Mutex::new(command_tx),
             command_rx: Mutex::new(Some(command_rx)),
         }
+    }
+}
+
+impl WaylandDisplaySrc {
+    fn send_command(&self, command: Command) {
+        let _ = self.command_tx.lock().unwrap().send(command);
+    }
+
+    /// Installs a fresh command channel and returns its receiver.
+    fn new_command_channel(&self) -> Channel<Command> {
+        let (command_tx, command_rx) = channel();
+        *self.command_tx.lock().unwrap() = command_tx;
+        command_rx
     }
 }
 
@@ -86,7 +100,7 @@ impl EventHandler for WaylandDisplaySrc {
                     let path = structure
                         .get::<String>("path")
                         .expect("Should contain the path to the device as a String");
-                    let _ = self.command_tx.send(Command::InputDevice(path));
+                    self.send_command(Command::InputDevice(path));
                     return true;
                 } else if structure.has_name("MouseMoveAbsolute") {
                     let x = structure
@@ -96,9 +110,7 @@ impl EventHandler for WaylandDisplaySrc {
                         .get::<f64>("pointer_y")
                         .expect("Should contain pointer_y");
 
-                    let _ = self
-                        .command_tx
-                        .send(Command::PointerMotionAbsolute((x, y).into()));
+                    self.send_command(Command::PointerMotionAbsolute((x, y).into()));
 
                     return true;
                 } else if structure.has_name("MouseMoveRelative") {
@@ -109,7 +121,7 @@ impl EventHandler for WaylandDisplaySrc {
                         .get::<f64>("pointer_y")
                         .expect("Should contain pointer_y");
 
-                    let _ = self.command_tx.send(Command::PointerMotion((x, y).into()));
+                    self.send_command(Command::PointerMotion((x, y).into()));
 
                     return true;
                 } else if structure.has_name("MouseButton") {
@@ -120,7 +132,7 @@ impl EventHandler for WaylandDisplaySrc {
                         .get::<bool>("pressed")
                         .expect("Should contain pressed");
 
-                    let _ = self.command_tx.send(Command::PointerButton(
+                    self.send_command(Command::PointerButton(
                         button,
                         if pressed {
                             ButtonState::Pressed
@@ -134,7 +146,7 @@ impl EventHandler for WaylandDisplaySrc {
                     let x = structure.get::<f64>("x").expect("Should contain x");
                     let y = structure.get::<f64>("y").expect("Should contain y");
 
-                    let _ = self.command_tx.send(Command::PointerAxis(x, y));
+                    self.send_command(Command::PointerAxis(x, y));
 
                     return true;
                 } else if structure.has_name("KeyboardKey") {
@@ -143,7 +155,7 @@ impl EventHandler for WaylandDisplaySrc {
                         .get::<bool>("pressed")
                         .expect("Should contain pressed");
 
-                    let _ = self.command_tx.send(Command::KeyboardInput(
+                    self.send_command(Command::KeyboardInput(
                         key,
                         if pressed {
                             KeyState::Pressed
@@ -157,25 +169,23 @@ impl EventHandler for WaylandDisplaySrc {
                     let x = structure.get::<f64>("x").expect("Should contain x");
                     let y = structure.get::<f64>("y").expect("Should contain y");
                     let id = structure.get::<u32>("id").expect("Should contain id");
-                    let _ = self.command_tx.send(Command::TouchDown(id, (x, y).into()));
+                    self.send_command(Command::TouchDown(id, (x, y).into()));
                     return true;
                 } else if structure.has_name("TouchUp") {
                     let id = structure.get::<u32>("id").expect("Should contain id");
-                    let _ = self.command_tx.send(Command::TouchUp(id));
+                    self.send_command(Command::TouchUp(id));
                     return true;
                 } else if structure.has_name("TouchMotion") {
                     let x = structure.get::<f64>("x").expect("Should contain x");
                     let y = structure.get::<f64>("y").expect("Should contain y");
                     let id = structure.get::<u32>("id").expect("Should contain id");
-                    let _ = self
-                        .command_tx
-                        .send(Command::TouchMotion(id, (x, y).into()));
+                    self.send_command(Command::TouchMotion(id, (x, y).into()));
                     return true;
                 } else if structure.has_name("TouchFrame") {
-                    let _ = self.command_tx.send(Command::TouchFrame);
+                    self.send_command(Command::TouchFrame);
                     return true;
                 } else if structure.has_name("TouchCancel") {
-                    let _ = self.command_tx.send(Command::TouchCancel);
+                    self.send_command(Command::TouchCancel);
                     return true;
                 }
             }
@@ -184,15 +194,13 @@ impl EventHandler for WaylandDisplaySrc {
 
                 match navigation_event {
                     NavigationEvent::MouseMove { x, y, .. } => {
-                        let _ = self
-                            .command_tx
-                            .send(Command::PointerMotionAbsolute((x, y).into()));
+                        self.send_command(Command::PointerMotionAbsolute((x, y).into()));
 
                         return true;
                     }
                     NavigationEvent::MouseButtonPress { button, .. } => {
                         if let Some(cmd) = gst_button_to_msg(button, ButtonState::Pressed) {
-                            let _ = self.command_tx.send(cmd);
+                            self.send_command(cmd);
                         } else {
                             tracing::warn!("Unknown mouse button pressed: {:?}", button);
                         }
@@ -201,7 +209,7 @@ impl EventHandler for WaylandDisplaySrc {
                     }
                     NavigationEvent::MouseButtonRelease { button, .. } => {
                         if let Some(cmd) = gst_button_to_msg(button, ButtonState::Released) {
-                            let _ = self.command_tx.send(cmd);
+                            self.send_command(cmd);
                         } else {
                             tracing::warn!("Unknown mouse button released: {:?}", button);
                         }
@@ -210,9 +218,7 @@ impl EventHandler for WaylandDisplaySrc {
                     }
                     NavigationEvent::KeyPress { key, .. } => {
                         if let Some(scancode) = gst_key_to_scancode(&key) {
-                            let _ = self
-                                .command_tx
-                                .send(Command::KeyboardInput(scancode, KeyState::Pressed));
+                            self.send_command(Command::KeyboardInput(scancode, KeyState::Pressed));
                         } else {
                             tracing::warn!("Unknown keyboard key pressed: {:?}", key);
                         }
@@ -221,9 +227,7 @@ impl EventHandler for WaylandDisplaySrc {
                     }
                     NavigationEvent::KeyRelease { key, .. } => {
                         if let Some(scancode) = gst_key_to_scancode(&key) {
-                            let _ = self
-                                .command_tx
-                                .send(Command::KeyboardInput(scancode, KeyState::Released));
+                            self.send_command(Command::KeyboardInput(scancode, KeyState::Released));
                         } else {
                             tracing::warn!("Unknown keyboard key pressed: {:?}", key);
                         }
@@ -705,11 +709,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 }
 
                 // Send the pool to the compositor
-                let _ = self
-                    .command_tx
-                    .send(Command::UpdateCUDABufferPool(Arc::new(Mutex::new(Some(
-                        pool,
-                    )))));
+                self.send_command(Command::UpdateCUDABufferPool(Arc::new(Mutex::new(Some(
+                    pool,
+                )))));
             }
             Err(err) => {
                 tracing::warn!("Failed to create CUDA buffer pool: {}", err);
@@ -775,7 +777,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             }
         };
 
-        let _ = self.command_tx.send(Command::VideoInfo(video_info));
+        self.send_command(Command::VideoInfo(video_info));
 
         self.parent_set_caps(caps)
     }
@@ -806,12 +808,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let subscriber = Registry::default().with(GstLayer);
 
         let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
-            let mut command_rx = self.command_rx.lock().unwrap();
-            WaylandDisplay::new_with_channel(
-                render_node.clone(),
-                self.command_tx.clone(),
-                command_rx.deref_mut().take().unwrap(),
-            )
+            // stop() puts a fresh receiver back, but a failed start() consumes it without one.
+            let command_rx = self.command_rx.lock().unwrap().take();
+            let command_rx = command_rx.unwrap_or_else(|| self.new_command_channel());
+            let command_tx = self.command_tx.lock().unwrap().clone();
+            WaylandDisplay::new_with_channel(render_node.clone(), command_tx, command_rx)
         }) else {
             return Err(gst::error_msg!(
                 LibraryError::Failed,
@@ -882,6 +883,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let subscriber = Registry::default().with(GstLayer);
             tracing::subscriber::with_default(subscriber, || drop(state.display));
         }
+        // The display dropped the receiver; commands sent before the next start() queue here.
+        let command_rx = self.new_command_channel();
+        *self.command_rx.lock().unwrap() = Some(command_rx);
         Ok(())
     }
 
@@ -1256,5 +1260,43 @@ mod tests {
             ),
             Some("RA24:0x0300000000000013".to_string())
         );
+    }
+
+    // XERK-1999: the first start() consumed the command receiver and stop() never replaced it,
+    // so the second start() panicked and the state change failed.
+    #[test]
+    fn restart_reaches_playing_again() {
+        use gst::prelude::*;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .build()
+            .upcast::<gst::Element>();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("width", 320)
+                    .field("height", 240)
+                    .field("framerate", gst::Fraction::new(30, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &caps, &sink]).unwrap();
+        gst::Element::link_many([&src, &caps, &sink]).unwrap();
+
+        for run in 0..2 {
+            pipeline
+                .set_state(gst::State::Playing)
+                .unwrap_or_else(|err| panic!("run {run}: set_state(Playing) failed: {err}"));
+            let (result, current, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+            assert!(result.is_ok(), "run {run}: state change failed");
+            assert_eq!(current, gst::State::Playing, "run {run}");
+            pipeline.set_state(gst::State::Null).unwrap();
+        }
     }
 }
