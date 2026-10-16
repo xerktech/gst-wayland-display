@@ -62,6 +62,17 @@ impl WaylandDisplaySrc {
     }
 }
 
+impl Settings {
+    /// Devices a new display is given on start(): configured ones, then announced ones.
+    fn startup_input_devices(&self) -> Vec<String> {
+        self.input_devices
+            .iter()
+            .chain(&self.virtual_input_devices)
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Settings {
     render_node: Option<String>,
@@ -105,10 +116,11 @@ impl EventHandler for WaylandDisplaySrc {
                     // Held across the send so it can't interleave with start() swapping the
                     // channel: the path is either in start()'s snapshot or sent to the new display.
                     let mut settings = self.settings.lock().unwrap();
+                    // Always forward: a reconnected device can reuse its old /dev/input path.
                     if !settings.virtual_input_devices.contains(&path) {
                         settings.virtual_input_devices.push(path.clone());
-                        self.send_command(Command::InputDevice(path));
                     }
+                    self.send_command(Command::InputDevice(path));
                     return true;
                 } else if structure.has_name("MouseMoveAbsolute") {
                     let x = structure
@@ -800,12 +812,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // either in this snapshot or on the new channel, never both or neither.
         let (render_node, input_devices, command_rx, command_tx) = {
             let settings = self.settings.lock().unwrap();
-            let input_devices = settings
-                .input_devices
-                .iter()
-                .chain(&settings.virtual_input_devices)
-                .cloned()
-                .collect::<Vec<_>>();
+            let input_devices = settings.startup_input_devices();
             let command_rx = self.new_command_channel();
             let command_tx = self.command_tx.lock().unwrap().clone();
             (
@@ -1373,7 +1380,7 @@ mod tests {
             assert!(stopped_send(imp).is_err(), "queued after stop()");
         }
         assert_eq!(
-            imp.settings.lock().unwrap().virtual_input_devices,
+            imp.settings.lock().unwrap().startup_input_devices(),
             ["/nonexistent/input/event0"]
         );
     }
