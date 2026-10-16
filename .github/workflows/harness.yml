@@ -12,7 +12,9 @@ jobs:
     name: harness (lint · build · unit)
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/games-on-whales/gstreamer:1.26.7
+      # Pinned by digest: upstream re-published the 1.26.7 tag on a Fedora base on 2026-10-15,
+      # which has no apt-get. This digest is the apt-based (Ubuntu 25.04) build the dependency step expects.
+      image: ghcr.io/games-on-whales/gstreamer:1.26.7@sha256:512b53b03b256a87fb4bd204ed1d91219148b0b77ff4ee4fc121c37d869f8d29
     steps:
       - uses: actions/checkout@v4
 
