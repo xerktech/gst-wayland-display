@@ -38,9 +38,11 @@ fn constructed_render_devices(render_node: &str) -> [Option<GPUDevice>; 2] {
     let display = WaylandDisplay::new(Some(render_node.into())).unwrap();
     let (command_tx, command_rx) = channel::<Command>();
     let display_with_channel =
-        WaylandDisplay::new_with_channel(Some(render_node.into()), command_tx, command_rx)
-            .unwrap();
-    [display.get_render_device(), display_with_channel.get_render_device()]
+        WaylandDisplay::new_with_channel(Some(render_node.into()), command_tx, command_rx).unwrap();
+    [
+        display.get_render_device(),
+        display_with_channel.get_render_device(),
+    ]
 }
 
 #[test]
@@ -53,5 +55,8 @@ fn software_render_target_has_no_render_device() {
 fn hardware_render_target_resolves_its_render_device() {
     let path = "/dev/dri/renderD128";
     let expected = GPUDevice::try_from(DrmNode::from_path(path).unwrap()).unwrap();
-    assert_eq!(constructed_render_devices(path), [Some(expected.clone()), Some(expected)]);
+    assert_eq!(
+        constructed_render_devices(path),
+        [Some(expected.clone()), Some(expected)]
+    );
 }
