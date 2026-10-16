@@ -12,9 +12,10 @@ pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use utils::RenderTarget;
 
 pub(crate) mod comp;
@@ -87,9 +88,17 @@ impl Drop for Trace {
     }
 }
 
+/// How long a caller waits for the compositor thread to answer a command before giving up.
+/// The streaming thread waits under its pad stream lock, so an unanswered command (a wedged or
+/// dead compositor event loop) must not block it forever. Generous on purpose: the first reply
+/// can queue behind compositor start-up and first-frame (e.g. CUDA) initialisation, and a tight
+/// bound would kill healthy streams.
+const COMPOSITOR_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct WaylandDisplay {
     thread_handle: Option<JoinHandle<()>>,
     command_tx: Sender<Command>,
+    reply_timeout: Duration,
 
     pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
@@ -138,6 +147,7 @@ impl WaylandDisplay {
         Ok(WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
+            reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -162,6 +172,7 @@ impl WaylandDisplay {
         Ok(WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
+            reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -256,7 +267,7 @@ impl WaylandDisplay {
             return Err(gst::FlowError::Eos);
         }
 
-        match buffer_rx.recv() {
+        match buffer_rx.recv_timeout(self.reply_timeout) {
             Ok(Ok(buffer)) => Ok(buffer),
             Ok(Err(err)) => match err {
                 SwapBuffersError::AlreadySwapped => unreachable!(),
@@ -270,12 +281,14 @@ impl WaylandDisplay {
         }
     }
 
-    pub fn get_supported_dma_formats(&self) -> FormatSet {
+    /// Fails when the compositor does not answer within the reply timeout, or is gone. Callers
+    /// must not treat that as "no formats": that would silently renegotiate to the wrong caps.
+    pub fn get_supported_dma_formats(&self) -> Result<FormatSet, RecvTimeoutError> {
         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
         let _ = self
             .command_tx
             .send(Command::GetSupportedDmaFormats(buffer_tx));
-        buffer_rx.recv().unwrap()
+        buffer_rx.recv_timeout(self.reply_timeout)
     }
 
     pub fn get_render_device(&self) -> Option<GPUDevice> {

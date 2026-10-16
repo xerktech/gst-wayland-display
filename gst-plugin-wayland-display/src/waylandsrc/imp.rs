@@ -549,7 +549,17 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let gst_dma_formats: Vec<String> = match state.as_ref() {
             None => Default::default(),
             Some(state) => {
-                let dma_formats = state.display.get_supported_dma_formats();
+                let dma_formats = match state.display.get_supported_dma_formats() {
+                    Ok(dma_formats) => dma_formats,
+                    Err(err) => {
+                        gst::element_imp_error!(
+                            self,
+                            gst::ResourceError::Failed,
+                            ["Compositor did not report its DMA formats: {}", err]
+                        );
+                        return None;
+                    }
+                };
 
                 let settings = self.settings.lock().unwrap();
                 let mut disable_workaround = settings.disable_intel_workaround;
@@ -728,7 +738,18 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     // memory:CUDAMemory will only get us a base format without modifiers,
                     // let's pick the first DRM format that matches the base format
                     let state = self.state.lock().unwrap();
-                    let dma_formats = state.as_ref().unwrap().display.get_supported_dma_formats();
+                    let dma_formats = state
+                        .as_ref()
+                        .unwrap()
+                        .display
+                        .get_supported_dma_formats()
+                        .map_err(|err| {
+                            gst::loggable_error!(
+                                CAT,
+                                "Compositor did not report its DMA formats: {}",
+                                err
+                            )
+                        })?;
                     let chosen_format =
                         gst_video_format_name_to_drm_fourcc(base_video_info.format().to_string())
                             .expect("failed to get drm format");
