@@ -31,8 +31,8 @@ use waylanddisplaycore::{
 pub struct WaylandDisplaySrc {
     state: Mutex<Option<State>>,
     settings: Mutex<Settings>,
-    // The display takes the receiver on start() and drops it on stop(), so the pair is replaced
-    // for each run; send through send_command(), never a cloned sender.
+    // The display takes the receiver on start() and drops it on stop(), so start() installs a
+    // fresh pair when it finds none; send through send_command(), never a cloned sender.
     command_tx: Mutex<Sender<Command>>,
     command_rx: Mutex<Option<Channel<Command>>>,
 }
@@ -808,7 +808,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let subscriber = Registry::default().with(GstLayer);
 
         let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
-            // stop() puts a fresh receiver back, but a failed start() consumes it without one.
+            // Only the first start() finds a receiver; a previous run or a failed start() consumed
+            // it. Commands sent while stopped went to the dead channel and are dropped on purpose,
+            // so stale input does not replay into the new session.
             let command_rx = self.command_rx.lock().unwrap().take();
             let command_rx = command_rx.unwrap_or_else(|| self.new_command_channel());
             let command_tx = self.command_tx.lock().unwrap().clone();
@@ -883,9 +885,6 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let subscriber = Registry::default().with(GstLayer);
             tracing::subscriber::with_default(subscriber, || drop(state.display));
         }
-        // The display dropped the receiver; commands sent before the next start() queue here.
-        let command_rx = self.new_command_channel();
-        *self.command_rx.lock().unwrap() = Some(command_rx);
         Ok(())
     }
 
@@ -1298,5 +1297,31 @@ mod tests {
             assert_eq!(current, gst::State::Playing, "run {run}");
             pipeline.set_state(gst::State::Null).unwrap();
         }
+    }
+
+    // A start() that fails after consuming the receiver must not break the next start().
+    #[test]
+    fn start_after_failed_start_reaches_playing() {
+        use gst::prelude::*;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "/nonexistent/renderD128")
+            .build()
+            .upcast::<gst::Element>();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+
+        assert!(pipeline.set_state(gst::State::Playing).is_err());
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        src.set_property("render-node", "software");
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (result, current, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+        assert!(result.is_ok(), "state change failed");
+        assert_eq!(current, gst::State::Playing);
+        pipeline.set_state(gst::State::Null).unwrap();
     }
 }
