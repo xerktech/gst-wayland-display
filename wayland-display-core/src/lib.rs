@@ -12,9 +12,10 @@ pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, RecvError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use utils::RenderTarget;
 
 pub(crate) mod comp;
@@ -86,9 +87,17 @@ impl Drop for Trace {
     }
 }
 
+/// How long a caller waits for the compositor thread to answer a command before giving up.
+/// The streaming thread waits under its pad stream lock, so an unanswered command (a wedged or
+/// dead compositor event loop) must not block it forever. Generous on purpose: the first reply
+/// can queue behind compositor start-up and first-frame (e.g. CUDA) initialisation, and a tight
+/// bound would kill healthy streams.
+const COMPOSITOR_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct WaylandDisplay {
     thread_handle: Option<JoinHandle<()>>,
     command_tx: Sender<Command>,
+    reply_timeout: Duration,
     // Resolved once at construction: the render node never changes, and asking the compositor
     // thread would block callers (the streaming thread, under its pad stream lock) forever if
     // the compositor stopped answering.
@@ -143,6 +152,7 @@ impl WaylandDisplay {
         Ok(WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
+            reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
             render_device,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
@@ -169,6 +179,7 @@ impl WaylandDisplay {
         Ok(WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
+            reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
             render_device,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
@@ -266,7 +277,7 @@ impl WaylandDisplay {
             return Err(gst::FlowError::Eos);
         }
 
-        match buffer_rx.recv() {
+        match buffer_rx.recv_timeout(self.reply_timeout) {
             Ok(Ok(buffer)) => Ok(buffer),
             Ok(Err(err)) => match err {
                 SwapBuffersError::AlreadySwapped => unreachable!(),
@@ -280,12 +291,14 @@ impl WaylandDisplay {
         }
     }
 
-    pub fn get_supported_dma_formats(&self) -> FormatSet {
+    /// Fails when the compositor does not answer within the reply timeout, or is gone. Callers
+    /// must not treat that as "no formats": that would silently renegotiate to the wrong caps.
+    pub fn get_supported_dma_formats(&self) -> Result<FormatSet, RecvTimeoutError> {
         let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
         let _ = self
             .command_tx
             .send(Command::GetSupportedDmaFormats(buffer_tx));
-        buffer_rx.recv().unwrap()
+        buffer_rx.recv_timeout(self.reply_timeout)
     }
 
     pub fn get_render_device(&self) -> Option<GPUDevice> {
@@ -312,7 +325,18 @@ impl Drop for WaylandDisplay {
             tracing::warn!("Failed to send stop command: {}", err);
             return;
         };
-        if self.thread_handle.take().unwrap().join().is_err() {
+        // A wedged compositor never acts on Quit; joining it unbounded would move the hang into
+        // pipeline teardown (stop() → drop). Give up after the reply timeout and detach it.
+        let thread_handle = self.thread_handle.take().unwrap();
+        let deadline = Instant::now() + self.reply_timeout;
+        while !thread_handle.is_finished() {
+            if Instant::now() >= deadline {
+                tracing::error!("Compositor thread did not quit in time; detaching it");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread_handle.join().is_err() {
             tracing::warn!("Failed to join compositor thread");
         };
     }

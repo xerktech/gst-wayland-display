@@ -13,6 +13,7 @@ fn dead_compositor_errs_instead_of_panicking() {
     let mut display = WaylandDisplay {
         thread_handle: Some(std::thread::spawn(|| {})),
         command_tx,
+        reply_timeout: crate::COMPOSITOR_REPLY_TIMEOUT,
         render_device: None,
         tracer: None,
         devices: MaybeRecv::Rx(devices_rx),
@@ -40,6 +41,7 @@ fn published_values_are_returned_and_cached() {
     let mut display = WaylandDisplay {
         thread_handle: Some(std::thread::spawn(|| {})),
         command_tx,
+        reply_timeout: crate::COMPOSITOR_REPLY_TIMEOUT,
         render_device: None,
         tracer: None,
         devices: MaybeRecv::Rx(devices_rx),
