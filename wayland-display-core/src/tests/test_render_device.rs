@@ -16,6 +16,7 @@ fn get_render_device_does_not_wait_on_compositor() {
     let display = WaylandDisplay {
         thread_handle: Some(std::thread::spawn(|| {})),
         command_tx,
+        render_device: None,
         tracer: None,
         devices: MaybeRecv::Rx(devices_rx),
         envs: MaybeRecv::Rx(envs_rx),
