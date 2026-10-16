@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use utils::RenderTarget;
 
 pub(crate) mod comp;
@@ -304,7 +304,18 @@ impl Drop for WaylandDisplay {
             tracing::warn!("Failed to send stop command: {}", err);
             return;
         };
-        if self.thread_handle.take().unwrap().join().is_err() {
+        // A wedged compositor never acts on Quit; joining it unbounded would move the hang into
+        // pipeline teardown (stop() → drop). Give up after the reply timeout and detach it.
+        let thread_handle = self.thread_handle.take().unwrap();
+        let deadline = Instant::now() + self.reply_timeout;
+        while !thread_handle.is_finished() {
+            if Instant::now() >= deadline {
+                tracing::error!("Compositor thread did not quit in time; detaching it");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread_handle.join().is_err() {
             tracing::warn!("Failed to join compositor thread");
         };
     }

@@ -2,7 +2,7 @@
 //! answers (e.g. its event loop is wedged): the streaming thread makes them under
 //! the pad stream lock, so an unbounded wait wedges the whole element.
 
-use crate::{Command, MaybeRecv, WaylandDisplay, channel};
+use crate::{COMPOSITOR_REPLY_TIMEOUT, Command, MaybeRecv, WaylandDisplay, channel};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -60,4 +60,25 @@ fn get_supported_dma_formats_errors_when_compositor_is_gone() {
     let result = returns_within(move || display.get_supported_dma_formats().is_err())
         .expect("get_supported_dma_formats panicked or blocked on a dead compositor");
     assert!(result);
+}
+
+#[test]
+fn drop_does_not_wait_forever_on_unanswered_compositor() {
+    // A compositor thread that never acts on Quit: teardown (stop() drops the display)
+    // must not hang on joining it.
+    let mut display = unanswered_display();
+    let (_never_tx, never_rx) = mpsc::channel::<()>();
+    std::mem::forget(_never_tx);
+    display.thread_handle = Some(std::thread::spawn(move || {
+        let _ = never_rx.recv();
+    }));
+    returns_within(move || drop(display))
+        .expect("dropping the display blocked on an unanswered compositor");
+}
+
+#[test]
+fn reply_timeout_leaves_room_for_slow_first_frames() {
+    // The first reply can queue behind compositor start-up and CUDA init; a tight
+    // bound would kill healthy streams.
+    assert!(COMPOSITOR_REPLY_TIMEOUT >= Duration::from_secs(10));
 }
