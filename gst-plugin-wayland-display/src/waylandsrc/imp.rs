@@ -31,20 +31,20 @@ use waylanddisplaycore::{
 pub struct WaylandDisplaySrc {
     state: Mutex<Option<State>>,
     settings: Mutex<Settings>,
-    // The display takes the receiver on start() and drops it on stop(), so start() installs a
-    // fresh pair when it finds none; send through send_command(), never a cloned sender.
+    // Replaced on every start(); the display owns the receiver and drops it on stop(), so commands
+    // sent while stopped fail instead of queueing stale input for the next run. Send through
+    // send_command(), never a cloned sender.
     command_tx: Mutex<Sender<Command>>,
-    command_rx: Mutex<Option<Channel<Command>>>,
 }
 
 impl Default for WaylandDisplaySrc {
     fn default() -> Self {
-        let (command_tx, command_rx) = channel();
+        // No display yet: drop the receiver so commands sent before start() are discarded.
+        let (command_tx, _) = channel();
         WaylandDisplaySrc {
             state: Mutex::new(None),
             settings: Mutex::new(Settings::default()),
             command_tx: Mutex::new(command_tx),
-            command_rx: Mutex::new(Some(command_rx)),
         }
     }
 }
@@ -66,6 +66,8 @@ impl WaylandDisplaySrc {
 pub struct Settings {
     render_node: Option<String>,
     input_devices: Vec<String>,
+    // Devices announced with VirtualDevicesReady; re-added on every start().
+    virtual_input_devices: Vec<String>,
     disable_intel_workaround: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
@@ -100,7 +102,13 @@ impl EventHandler for WaylandDisplaySrc {
                     let path = structure
                         .get::<String>("path")
                         .expect("Should contain the path to the device as a String");
-                    self.send_command(Command::InputDevice(path));
+                    // Held across the send so it can't interleave with start() swapping the
+                    // channel: the path is either in start()'s snapshot or sent to the new display.
+                    let mut settings = self.settings.lock().unwrap();
+                    if !settings.virtual_input_devices.contains(&path) {
+                        settings.virtual_input_devices.push(path.clone());
+                        self.send_command(Command::InputDevice(path));
+                    }
                     return true;
                 } else if structure.has_name("MouseMoveAbsolute") {
                     let x = structure
@@ -788,32 +796,32 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             return Ok(());
         }
 
-        #[cfg(feature = "cuda")]
-        let (render_node, input_devices, have_cuda_context) = {
+        // The channel is swapped under the settings lock so a concurrent VirtualDevicesReady lands
+        // either in this snapshot or on the new channel, never both or neither.
+        let (render_node, input_devices, command_rx, command_tx) = {
             let settings = self.settings.lock().unwrap();
+            let input_devices = settings
+                .input_devices
+                .iter()
+                .chain(&settings.virtual_input_devices)
+                .cloned()
+                .collect::<Vec<_>>();
+            let command_rx = self.new_command_channel();
+            let command_tx = self.command_tx.lock().unwrap().clone();
             (
                 settings.render_node.clone(),
-                settings.input_devices.clone(),
-                settings.cuda_context.is_some(),
+                input_devices,
+                command_rx,
+                command_tx,
             )
         };
-
-        #[cfg(not(feature = "cuda"))]
-        let (render_node, input_devices) = {
-            let settings = self.settings.lock().unwrap();
-            (settings.render_node.clone(), settings.input_devices.clone())
-        };
+        #[cfg(feature = "cuda")]
+        let have_cuda_context = self.settings.lock().unwrap().cuda_context.is_some();
 
         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
         let subscriber = Registry::default().with(GstLayer);
 
         let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
-            // Only the first start() finds a receiver; a previous run or a failed start() consumed
-            // it. Commands sent while stopped went to the dead channel and are dropped on purpose,
-            // so stale input does not replay into the new session.
-            let command_rx = self.command_rx.lock().unwrap().take();
-            let command_rx = command_rx.unwrap_or_else(|| self.new_command_channel());
-            let command_tx = self.command_tx.lock().unwrap().clone();
             WaylandDisplay::new_with_channel(render_node.clone(), command_tx, command_rx)
         }) else {
             return Err(gst::error_msg!(
@@ -1323,5 +1331,50 @@ mod tests {
         assert!(result.is_ok(), "state change failed");
         assert_eq!(current, gst::State::Playing);
         pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // Commands sent while no display runs must fail rather than queue and replay into the next
+    // run, and VirtualDevicesReady devices must be kept for the next start().
+    #[test]
+    fn stopped_element_drops_input_and_keeps_virtual_devices() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use waylanddisplaycore::Command;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .build();
+        let imp = src.imp();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([src.upcast_ref(), &sink]).unwrap();
+        src.link(&sink).unwrap();
+
+        let stopped_send = |imp: &super::WaylandDisplaySrc| {
+            imp.command_tx.lock().unwrap().send(Command::TouchFrame)
+        };
+        assert!(
+            stopped_send(imp).is_err(),
+            "queued before the first start()"
+        );
+
+        let device = gst::event::CustomUpstream::new(
+            gst::Structure::builder("VirtualDevicesReady")
+                .field("path", "/nonexistent/input/event0")
+                .build(),
+        );
+        for _ in 0..2 {
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let (result, _, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+            assert!(result.is_ok());
+            assert!(src.send_event(device.clone()));
+            pipeline.set_state(gst::State::Null).unwrap();
+            assert!(stopped_send(imp).is_err(), "queued after stop()");
+        }
+        assert_eq!(
+            imp.settings.lock().unwrap().virtual_input_devices,
+            ["/nonexistent/input/event0"]
+        );
     }
 }
