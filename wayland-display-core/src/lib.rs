@@ -1,5 +1,5 @@
 use smithay::backend::SwapBuffersError;
-use smithay::backend::drm::CreateDrmNodeError;
+use smithay::backend::drm::{CreateDrmNodeError, DrmNode};
 pub use smithay::reexports::calloop::channel::{Channel, Sender, channel};
 
 #[cfg(feature = "cuda")]
@@ -41,7 +41,6 @@ pub enum Command {
     PointerButton(u32, ButtonState),
     PointerAxis(f64, f64),
     GetSupportedDmaFormats(SyncSender<FormatSet>),
-    GetRenderDevice(SyncSender<Option<GPUDevice>>),
     TouchDown(u32, Point<f64, Logical>),
     TouchUp(u32),
     TouchMotion(u32, Point<f64, Logical>),
@@ -99,6 +98,10 @@ pub struct WaylandDisplay {
     thread_handle: Option<JoinHandle<()>>,
     command_tx: Sender<Command>,
     reply_timeout: Duration,
+    // Resolved once at construction: the render node never changes, and asking the compositor
+    // thread would block callers (the streaming thread, under its pad stream lock) forever if
+    // the compositor stopped answering.
+    render_device: Option<GPUDevice>,
 
     pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
@@ -131,6 +134,7 @@ impl WaylandDisplay {
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
+        let render_device = render_device(&render_target);
 
         let thread_handle = std::thread::spawn(move || {
             if let Err(err) = std::panic::catch_unwind(|| {
@@ -148,6 +152,7 @@ impl WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
             reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
+            render_device,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -164,6 +169,7 @@ impl WaylandDisplay {
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
+        let render_device = render_device(&render_target);
 
         let thread_handle = std::thread::spawn(move || {
             comp::init(commands_rx, render_target, devices_tx, envs_tx);
@@ -173,6 +179,7 @@ impl WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
             reply_timeout: COMPOSITOR_REPLY_TIMEOUT,
+            render_device,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -292,10 +299,21 @@ impl WaylandDisplay {
     }
 
     pub fn get_render_device(&self) -> Option<GPUDevice> {
-        let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
-        let _ = self.command_tx.send(Command::GetRenderDevice(buffer_tx));
-        buffer_rx.recv().unwrap()
+        self.render_device.clone()
     }
+}
+
+fn render_device(render_target: &RenderTarget) -> Option<GPUDevice> {
+    let node: Option<DrmNode> = render_target.clone().into();
+    let render_device = match GPUDevice::try_from(node?) {
+        Ok(device) => Some(device),
+        Err(err) => {
+            tracing::warn!("Failed to identify the render device: {}", err);
+            None
+        }
+    };
+    tracing::debug!("Render device: {:?}", render_device);
+    render_device
 }
 
 impl Drop for WaylandDisplay {

@@ -17,6 +17,7 @@ fn unanswered_display() -> WaylandDisplay {
         thread_handle: Some(std::thread::spawn(|| {})),
         command_tx,
         reply_timeout: Duration::from_millis(200),
+        render_device: None,
         tracer: None,
         devices: MaybeRecv::Rx(devices_rx),
         envs: MaybeRecv::Rx(envs_rx),
