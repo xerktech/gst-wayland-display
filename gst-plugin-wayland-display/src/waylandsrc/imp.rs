@@ -839,7 +839,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         let Ok(env_vars) = display.env_vars() else {
             return Err(gst::error_msg!(
                 LibraryError::Init,
-                ("The compositor failed to start, see the log for the cause.")
+                ("The compositor exited during initialization (its panic message is on stderr); check `render-node`, or set `render-node=software` for software rendering.")
             ));
         };
         for (key, var) in env_vars.flat_map(|var| var.split_once("=")) {
