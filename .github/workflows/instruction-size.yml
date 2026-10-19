@@ -1,0 +1,23 @@
+name: instruction file size
+
+on:
+  push:
+    paths: ["**/CLAUDE.md", "**/CLAUDE.local.md", ".claude/rules/**"]
+  pull_request:
+    paths: ["**/CLAUDE.md", "**/CLAUDE.local.md", ".claude/rules/**"]
+
+jobs:
+  size:
+    name: instruction files < 40k chars
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Claude Code warns above 40,000 characters and adherence drops; split by path instead.
+      - run: |
+          fail=0
+          while IFS= read -r -d '' f; do
+            n=$(wc -m < "$f")
+            echo "$f: $n"
+            [ "$n" -lt 40000 ] || { echo "::error file=$f::$n chars >= 40000"; fail=1; }
+          done < <(find . -path ./.git -prune -o \( -name CLAUDE.md -o -name CLAUDE.local.md -o -path './.claude/rules/*.md' \) -type f -print0)
+          exit $fail
