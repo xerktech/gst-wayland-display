@@ -1480,8 +1480,10 @@ mod tests {
             "an unanswered frame must be an error"
         );
         compositor_tx.send(Command::Quit).unwrap();
-        drop(unserviced);
+        // Drop the display while `unserviced` still exists: its own Quit must send for Drop to
+        // join the compositor thread, or the thread outlives the test and races process exit.
         src.imp().state.lock().unwrap().take();
+        drop(unserviced);
         assert!(
             state_free,
             "create() held the state lock while waiting for the frame"
