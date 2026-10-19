@@ -168,7 +168,7 @@ impl CompositorHandler for State {
             // apply_video_info send its initial configure, instead of dropping it -- a
             // dropped window never gets configured, mapped or focused.
             let Some(output) = self.output.as_ref() else {
-                self.pending_windows.push(window);
+                self.windows_awaiting_output.push(window);
                 return;
             };
 

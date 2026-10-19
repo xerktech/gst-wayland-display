@@ -233,6 +233,15 @@ impl WaylandClient {
         window.ack_last_and_commit();
     }
 
+    /// The most recent toplevel `configure` received on the first window.
+    pub fn last_configure(&self) -> Option<&Configure> {
+        self.state
+            .windows
+            .first()
+            .and_then(|w| w.configures_received.last())
+            .map(|(_, c)| c)
+    }
+
     /// Destroy the most recently created window (toplevel, xdg_surface, then surface).
     pub fn destroy_window(&mut self) {
         let window = self.state.windows.pop().unwrap();

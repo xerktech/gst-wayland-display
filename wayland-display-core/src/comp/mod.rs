@@ -129,6 +129,9 @@ pub struct State {
     pub cursor_state: CursorImageStatus,
     surpressed_keys: HashSet<u32>,
     pub pending_windows: Vec<Window>,
+    /// Toplevels whose initial commit arrived before the output existed; they get their
+    /// initial configure (and move to `pending_windows`) once `apply_video_info` runs.
+    pub windows_awaiting_output: Vec<Window>,
     input_context: Libinput,
 
     // wayland state
@@ -287,6 +290,7 @@ impl State {
             cursor_event_count: 0,
             surpressed_keys: HashSet::new(),
             pending_windows: Vec::new(),
+            windows_awaiting_output: Vec::new(),
             input_context: input_context.clone(),
 
             dh: dh.clone(),
@@ -436,13 +440,19 @@ pub(crate) fn apply_video_info(
         toplevel.send_configure();
     }
 
-    // Toplevels that committed before the output existed were held back unconfigured
-    // (see the compositor commit handler); configure them now that there is a size.
+    // Toplevels already configured but not yet mapped would otherwise keep the old size.
     for window in &state.pending_windows {
         let toplevel = window.toplevel().unwrap();
-        if !initial_configure_sent(toplevel) {
+        if initial_configure_sent(toplevel) {
             send_initial_configure(output, toplevel);
         }
+    }
+
+    // Toplevels that committed before the output existed couldn't be sized; configure
+    // them now and hand them to the normal commit path, which maps them on their next commit.
+    for window in state.windows_awaiting_output.drain(..) {
+        send_initial_configure(output, window.toplevel().unwrap());
+        state.pending_windows.push(window);
     }
 }
 

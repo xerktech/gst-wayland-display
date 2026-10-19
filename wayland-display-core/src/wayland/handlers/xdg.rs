@@ -28,10 +28,10 @@ impl XdgShellHandler for State {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        // A toplevel destroyed before it mapped (e.g. while held waiting for the output)
-        // must not linger in pending_windows.
-        self.pending_windows
-            .retain(|w| w.toplevel().map(|t| t != &surface).unwrap_or(true));
+        // A toplevel destroyed before it mapped must not linger in either holding list.
+        let other = |w: &Window| w.toplevel().map(|t| t != &surface).unwrap_or(true);
+        self.pending_windows.retain(other);
+        self.windows_awaiting_output.retain(other);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
