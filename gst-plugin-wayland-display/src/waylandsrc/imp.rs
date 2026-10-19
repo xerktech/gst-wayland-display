@@ -913,14 +913,15 @@ impl PushSrcImpl for WaylandDisplaySrc {
         &self,
         _buffer: Option<&mut gst::BufferRef>,
     ) -> Result<CreateSuccess, gst::FlowError> {
-        let mut state_guard = self.state.lock().unwrap();
-        let Some(state) = state_guard.as_mut() else {
-            return Err(gst::FlowError::Eos);
-        };
-
         let subscriber = Registry::default().with(GstLayer);
         tracing::subscriber::with_default(subscriber, || {
-            state.display.frame().map(CreateSuccess::NewBuffer)
+            // Only the request is made under the state lock: waiting for the frame under it
+            // would stall caps queries and stop() for up to the compositor reply timeout.
+            let pending = match self.state.lock().unwrap().as_ref() {
+                Some(state) => state.display.request_frame()?,
+                None => return Err(gst::FlowError::Eos),
+            };
+            pending.wait().map(CreateSuccess::NewBuffer)
         })
     }
 }
@@ -1382,6 +1383,41 @@ mod tests {
         assert_eq!(
             imp.settings.lock().unwrap().startup_input_devices(),
             ["/nonexistent/input/event0"]
+        );
+    }
+
+    // A reconnected device can reuse its old /dev/input path, so every announcement must reach
+    // the running display, not only the first one for a path.
+    #[test]
+    fn virtual_devices_ready_forwards_every_announcement() {
+        use super::EventHandler;
+        use gst::subclass::prelude::*;
+        use waylanddisplaycore::Command;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        let imp = src.imp();
+        // Stands in for a running display's receiver.
+        let command_rx = imp.new_command_channel();
+        let device = gst::event::CustomUpstream::new(
+            gst::Structure::builder("VirtualDevicesReady")
+                .field("path", "/dev/input/event7")
+                .build(),
+        );
+        for _ in 0..2 {
+            assert!(imp.handle_event(&device));
+        }
+
+        let mut forwarded = Vec::new();
+        while let Ok(command) = command_rx.try_recv() {
+            if let Command::InputDevice(path) = command {
+                forwarded.push(path);
+            }
+        }
+        assert_eq!(forwarded, ["/dev/input/event7", "/dev/input/event7"]);
+        assert_eq!(
+            imp.settings.lock().unwrap().startup_input_devices(),
+            ["/dev/input/event7"]
         );
     }
 }
