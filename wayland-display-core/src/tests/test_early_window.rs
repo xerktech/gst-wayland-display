@@ -90,6 +90,29 @@ fn resize_before_map_reconfigures_unmapped_window() {
 }
 
 #[test]
+fn uncommitted_window_is_not_configured_early() {
+    let mut f = Fixture::new_without_output();
+
+    // xdg-shell: the initial configure answers the initial commit, so a toplevel that
+    // hasn't committed when the output appears must not be configured yet.
+    f.client.create_window_uncommitted();
+    f.round_trip();
+    apply(&mut f, 320, 240);
+    apply(&mut f, 640, 480);
+    assert_eq!(f.client.configure_count(), 0);
+
+    f.client.commit_window();
+    f.round_trip();
+    assert_eq!(f.client.configure_count(), 1);
+    assert_fullscreen_configure(&f, (640, 480));
+
+    f.client.setup_window(640, 480);
+    f.round_trip();
+    f.round_trip();
+    assert_eq!(f.server.space.elements().count(), 1);
+}
+
+#[test]
 fn window_destroyed_before_output_is_forgotten() {
     let mut f = Fixture::new_without_output();
 

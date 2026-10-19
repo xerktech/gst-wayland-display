@@ -222,7 +222,18 @@ impl WaylandClient {
     }
 
     pub fn create_window(&mut self) {
-        self.state.create_window();
+        self.state.create_window_uncommitted();
+        self.commit_window();
+    }
+
+    /// Create a toplevel but hold back its initial commit (see `commit_window`).
+    pub fn create_window_uncommitted(&mut self) {
+        self.state.create_window_uncommitted();
+    }
+
+    /// Commit the most recently created window's surface.
+    pub fn commit_window(&self) {
+        self.state.windows.last().unwrap().commit();
     }
 
     pub fn setup_window(&mut self, width: u16, height: u16) {
@@ -359,7 +370,8 @@ impl WaylandClient {
 }
 
 impl State {
-    pub fn create_window(&mut self) {
+    /// Create a toplevel without its initial commit.
+    pub fn create_window_uncommitted(&mut self) {
         let compositor = self.compositor.as_ref().unwrap();
         let xdg_wm_base = self.wm_base.as_ref().unwrap();
         let viewporter = self.viewporter.as_ref().unwrap();
@@ -369,7 +381,7 @@ impl State {
         let xdg_toplevel = xdg_surface.get_toplevel(&self.qh, ());
         let viewport = viewporter.get_viewport(&surface, &self.qh, ());
 
-        let window = Window {
+        self.windows.push(Window {
             surface,
             xdg_surface,
             xdg_toplevel,
@@ -377,11 +389,7 @@ impl State {
             pending_configure: Configure::default(),
             configures_received: Vec::new(),
             close_requested: false,
-        };
-
-        window.commit();
-
-        self.windows.push(window);
+        });
     }
 }
 
