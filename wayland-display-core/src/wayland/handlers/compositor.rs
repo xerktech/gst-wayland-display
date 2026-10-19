@@ -2,6 +2,7 @@ use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor, delegate_single_pixel_buffer,
     desktop::PopupKind,
+    output::Output,
     reexports::{
         calloop::Interest,
         wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
@@ -20,11 +21,55 @@ use smithay::{
         dmabuf::get_dmabuf,
         drm_syncobj::DrmSyncobjCachedState,
         seat::WaylandFocus,
-        shell::xdg::{SurfaceCachedState, XdgPopupSurfaceData, XdgToplevelSurfaceData},
+        shell::xdg::{
+            SurfaceCachedState, ToplevelSurface, XdgPopupSurfaceData, XdgToplevelSurfaceData,
+        },
     },
 };
 
 use crate::comp::{ClientState, FocusTarget, State};
+
+pub(crate) fn initial_configure_sent(toplevel: &ToplevelSurface) -> bool {
+    with_states(toplevel.wl_surface(), |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .initial_configure_sent
+    })
+}
+
+/// Fullscreen the toplevel at the output's size (unless it declared a max size) and
+/// activate it.
+pub(crate) fn send_initial_configure(output: &Output, toplevel: &ToplevelSurface) {
+    let max_size = with_states(toplevel.wl_surface(), |states| {
+        states
+            .cached_state
+            .get::<SurfaceCachedState>()
+            .current()
+            .max_size
+    });
+    if max_size.w == 0 && max_size.h == 0 {
+        toplevel.with_pending_state(|state| {
+            state.size = Some(
+                output
+                    .current_mode()
+                    .unwrap()
+                    .size
+                    .to_f64()
+                    .to_logical(output.current_scale().fractional_scale())
+                    .to_i32_round(),
+            );
+            state.states.set(XdgState::Fullscreen);
+        });
+    }
+    toplevel.with_pending_state(|state| {
+        state.states.set(XdgState::Activated);
+    });
+    toplevel.send_configure();
+}
 
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
@@ -118,52 +163,18 @@ impl CompositorHandler for State {
         {
             let window = self.pending_windows.swap_remove(idx);
 
-            let toplevel = window.toplevel().unwrap();
-            let (initial_configure_sent, max_size) = with_states(surface, |states| {
-                let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap();
-                let attributes_guard = attributes.lock().unwrap();
-
-                (
-                    attributes_guard.initial_configure_sent,
-                    states
-                        .cached_state
-                        .get::<SurfaceCachedState>()
-                        .current()
-                        .max_size,
-                )
-            });
-
-            if self.output.is_none() {
+            // The output only exists once caps are negotiated (apply_video_info). A client
+            // that commits before then can't be sized yet: hold the window and let
+            // apply_video_info send its initial configure, instead of dropping it -- a
+            // dropped window never gets configured, mapped or focused.
+            let Some(output) = self.output.as_ref() else {
+                self.pending_windows.push(window);
                 return;
-            }
+            };
 
-            if !initial_configure_sent {
-                if max_size.w == 0 && max_size.h == 0 {
-                    toplevel.with_pending_state(|state| {
-                        state.size = Some(
-                            self.output
-                                .as_ref()
-                                .unwrap()
-                                .current_mode()
-                                .unwrap()
-                                .size
-                                .to_f64()
-                                .to_logical(
-                                    self.output
-                                        .as_ref()
-                                        .unwrap()
-                                        .current_scale()
-                                        .fractional_scale(),
-                                )
-                                .to_i32_round(),
-                        );
-                        state.states.set(XdgState::Fullscreen);
-                    });
-                }
-                toplevel.with_pending_state(|state| {
-                    state.states.set(XdgState::Activated);
-                });
-                toplevel.send_configure();
+            let toplevel = window.toplevel().unwrap();
+            if !initial_configure_sent(toplevel) {
+                send_initial_configure(output, toplevel);
                 self.pending_windows.push(window);
             } else {
                 let loc = (0, 0);

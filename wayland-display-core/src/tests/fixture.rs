@@ -25,6 +25,15 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
+        let mut f = Self::new_without_output();
+        f.create_server_output();
+        f.round_trip();
+        f
+    }
+
+    /// A connected client and a compositor that has no output yet -- the state before the
+    /// pipeline negotiates caps, when `apply_video_info` creates the output.
+    pub fn new_without_output() -> Self {
         INIT.call_once(|| {
             gst::init().expect("Failed to initialize GStreamer");
         });
@@ -81,8 +90,6 @@ impl Fixture {
             server: server_state,
             server_event_loop: event_loop,
         };
-
-        f.create_server_output();
         f.round_trip();
 
         f

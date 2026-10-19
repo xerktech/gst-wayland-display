@@ -233,6 +233,14 @@ impl WaylandClient {
         window.ack_last_and_commit();
     }
 
+    /// Destroy the most recently created window (toplevel, xdg_surface, then surface).
+    pub fn destroy_window(&mut self) {
+        let window = self.state.windows.pop().unwrap();
+        window.xdg_toplevel.destroy();
+        window.xdg_surface.destroy();
+        window.surface.destroy();
+    }
+
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {
         self.state.mouse_events.as_mut()
     }

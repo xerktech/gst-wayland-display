@@ -85,6 +85,7 @@ use crate::utils::allocator::{
     gst_video_format_to_drm_modifier, new_gbm_device,
 };
 use crate::utils::renderer::setup_renderer;
+use crate::wayland::handlers::compositor::{initial_configure_sent, send_initial_configure};
 use crate::{utils::RenderTarget, wayland::protocols::wl_drm::create_drm_global};
 
 #[derive(Debug, Default)]
@@ -433,6 +434,15 @@ pub(crate) fn apply_video_info(
             state.states.set(XdgState::Activated);
         });
         toplevel.send_configure();
+    }
+
+    // Toplevels that committed before the output existed were held back unconfigured
+    // (see the compositor commit handler); configure them now that there is a size.
+    for window in &state.pending_windows {
+        let toplevel = window.toplevel().unwrap();
+        if !initial_configure_sent(toplevel) {
+            send_initial_configure(output, toplevel);
+        }
     }
 }
 
