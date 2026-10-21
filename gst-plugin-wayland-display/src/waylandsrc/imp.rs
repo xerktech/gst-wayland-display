@@ -1797,13 +1797,20 @@ mod tests {
     #[test]
     fn frames_flow_after_quick_pause_resume() {
         use gst::prelude::*;
+        use gst::subclass::prelude::*;
         test_init();
 
-        let (pipeline, _src, frames) = counting_pipeline();
+        let (pipeline, src, frames) = counting_pipeline();
+        let imp = src
+            .downcast_ref::<super::super::WaylandDisplaySrc>()
+            .unwrap()
+            .imp();
         pipeline.set_state(gst::State::Playing).unwrap();
         assert_frames_flow(&frames, "start");
         for run in 0..100 {
             pipeline.set_state(gst::State::Paused).unwrap();
+            // Left set, it would stop a later flush or stop from cancelling the frame wait.
+            assert!(!imp.pausing.load(std::sync::atomic::Ordering::Acquire));
             pipeline.set_state(gst::State::Playing).unwrap();
             assert_frames_flow(&frames, &format!("resume {run}"));
         }
