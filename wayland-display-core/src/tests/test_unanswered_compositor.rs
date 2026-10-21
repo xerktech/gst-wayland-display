@@ -100,6 +100,27 @@ fn reply_timeout_leaves_room_for_slow_first_frames() {
     assert!(COMPOSITOR_REPLY_TIMEOUT >= Duration::from_secs(10));
 }
 
+// The compositor must be able to hand over a frame nobody is receiving yet (a create() cancelled
+// by unlock() picks it up later); a rendezvous channel blocks its event loop until then.
+#[test]
+fn frame_reply_does_not_block_the_compositor() {
+    gst::init().unwrap();
+    let display = unanswered_display();
+    let (command_tx, unserviced) = channel::<Command>();
+    let mut display = display;
+    display.command_tx = command_tx;
+    let pending = display.request_frame().unwrap();
+    let Ok(Command::Buffer(reply, _)) = unserviced.try_recv() else {
+        panic!("no frame request sent");
+    };
+    assert!(
+        reply.try_send(Ok(gst::Buffer::new())).is_ok(),
+        "delivering the frame would block the compositor"
+    );
+    assert!(pending.wait().is_ok());
+    std::mem::forget(unserviced);
+}
+
 // XERK-2103: after start() waited out env_vars(), dropping the display waited a second full
 // timeout for Quit, and C callers asking for the env length and then the entries waited twice.
 #[test]

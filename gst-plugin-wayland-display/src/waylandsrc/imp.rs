@@ -1294,9 +1294,61 @@ mod tests {
     use waylanddisplaycore::DrmFormat;
     use waylanddisplaycore::utils::tests::INIT;
 
+    /// Paths the compositor logged as "Adding input device.", across all tests in this binary.
+    static ADDED_INPUT_DEVICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Records the paths of the compositor's "Adding input device." events.
+    struct AddedInputDevices;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AddedInputDevices {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Fields {
+                message: String,
+                path: Option<String>,
+            }
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "path" {
+                        self.path = Some(value.to_string());
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    }
+                }
+            }
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            if let (true, Some(path)) = (fields.message == "Adding input device.", fields.path) {
+                ADDED_INPUT_DEVICES.lock().unwrap().push(path);
+            }
+        }
+    }
+
     fn test_init() -> () {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
         INIT.call_once(|| {
-            tracing_subscriber::fmt::try_init().ok();
+            // Global, so the compositor threads' events reach AddedInputDevices too.
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                )
+                .with(AddedInputDevices)
+                .try_init()
+                .ok();
             gst::init().expect("Failed to initialize GStreamer");
         });
     }
@@ -1815,5 +1867,112 @@ mod tests {
             assert_frames_flow(&frames, &format!("resume {run}"));
         }
         pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // start() must give the display it creates the configured devices; a start() that installed
+    // a plain command channel instead passed every other test.
+    #[test]
+    fn started_display_adds_configured_devices() {
+        use gst::prelude::*;
+        use std::time::{Duration, Instant};
+        test_init();
+
+        let path = "/nonexistent/input/started-display-keyboard";
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .property("keyboard", path)
+            .build()
+            .upcast::<gst::Element>();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ADDED_INPUT_DEVICES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|added| added == path)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the compositor never added the configured device"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // A pipeline stop must unlock() a create() whose frame the compositor never sends, going
+    // through change_state() like a real stop, not only when unlock() is called directly.
+    #[test]
+    fn stop_does_not_wait_for_an_unanswered_frame() {
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use std::time::{Duration, Instant};
+        use waylanddisplaycore::{Command, FormatSet};
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        // start() keeps a display that is already there, so the pipeline runs on this one.
+        let (unserviced, compositor_tx) = unserviced_display(&src);
+        // Answers caps queries but never sends a frame, like a compositor that wedges mid-stream.
+        let (frame_requested_tx, frame_requested) = std::sync::mpsc::channel();
+        let wedge = std::thread::spawn(move || {
+            let mut owed_frames = Vec::new();
+            loop {
+                match unserviced.try_recv() {
+                    Ok(Command::GetSupportedDmaFormats(reply)) => {
+                        let _ = reply.send(FormatSet::default());
+                    }
+                    Ok(command @ Command::Buffer(..)) => {
+                        owed_frames.push(command);
+                        let _ = frame_requested_tx.send(());
+                    }
+                    // stop() is dropping the display: let the real compositor quit so Drop can
+                    // join it.
+                    Ok(Command::Quit) => {
+                        compositor_tx.send(Command::Quit).unwrap();
+                        return (unserviced, owed_frames);
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("width", 320)
+                    .field("height", 240)
+                    .field("framerate", gst::Fraction::new(30, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([src.upcast_ref(), &caps, &sink]).unwrap();
+        gst::Element::link_many([src.upcast_ref(), &caps, &sink]).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        frame_requested
+            .recv_timeout(Duration::from_secs(5))
+            .expect("create() never requested a frame");
+
+        let stopping = Instant::now();
+        pipeline.set_state(gst::State::Null).unwrap();
+        let stop_took = stopping.elapsed();
+
+        let (unserviced, owed_frames) = wedge.join().unwrap();
+        drop(owed_frames);
+        drop(unserviced);
+        assert!(
+            stop_took < Duration::from_secs(5),
+            "stop waited {stop_took:?} behind an unanswered frame"
+        );
     }
 }
