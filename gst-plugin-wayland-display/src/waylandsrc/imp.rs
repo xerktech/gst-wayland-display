@@ -2037,19 +2037,36 @@ mod tests {
         let held = Arc::new(AtomicBool::new(false));
         let src_addr = src.as_ptr() as usize;
         let holding = held.clone();
-        gst::DebugCategory::get("basesrc")
-            .unwrap()
-            .set_threshold(gst::DebugLevel::Debug);
-        let hook = gst::log::add_log_function(move |_, _, _, _, _, object, message| {
-            if object.map(|o| o.as_ptr() as usize) == Some(src_addr)
-                && message
-                    .get()
-                    .is_some_and(|m| m.starts_with("live running 0"))
-                && !holding.swap(true, Ordering::SeqCst)
-            {
-                std::thread::sleep(hold);
+        // Process-wide: undone on drop, panic included, so later tests don't print basesrc
+        // debug output or run a hook keyed on a freed element.
+        struct HoldGuard(
+            gst::DebugCategory,
+            gst::DebugLevel,
+            Option<gst::log::DebugLogFunction>,
+        );
+        impl Drop for HoldGuard {
+            fn drop(&mut self) {
+                if let Some(hook) = self.2.take() {
+                    gst::log::remove_log_function(hook);
+                }
+                self.0.set_threshold(self.1);
             }
-        });
+        }
+        let basesrc = gst::DebugCategory::get("basesrc").unwrap();
+        let mut guard = HoldGuard(basesrc, basesrc.threshold(), None);
+        basesrc.set_threshold(gst::DebugLevel::Debug);
+        guard.2 = Some(gst::log::add_log_function(
+            move |_, _, _, _, _, object, message| {
+                if object.map(|o| o.as_ptr() as usize) == Some(src_addr)
+                    && message
+                        .get()
+                        .is_some_and(|m| m.starts_with("live running 0"))
+                    && !holding.swap(true, Ordering::SeqCst)
+                {
+                    std::thread::sleep(hold);
+                }
+            },
+        ));
 
         let pausing = {
             let pipeline = pipeline.clone();
@@ -2080,7 +2097,7 @@ mod tests {
 
         pausing.join().unwrap();
         assert!(flushing.join().unwrap());
-        gst::log::remove_log_function(hook);
+        drop(guard);
         assert!(
             sink.static_pad("sink")
                 .unwrap()
