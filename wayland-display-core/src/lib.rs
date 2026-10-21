@@ -308,7 +308,9 @@ impl WaylandDisplay {
     /// Asks the compositor for the next frame without waiting for it, so a caller holding a lock
     /// around the display can release it before blocking in [`PendingFrame::wait`].
     pub fn request_frame(&self) -> Result<PendingFrame, gst::FlowError> {
-        let (buffer_tx, buffer_rx) = mpsc::sync_channel(0);
+        // Room for the one reply: the compositor must not block handing over a frame whose
+        // waiter was cancelled (PendingFrame::wait_unless) and will only pick it up later.
+        let (buffer_tx, buffer_rx) = mpsc::sync_channel(1);
         if let Err(err) = self
             .command_tx
             .send(Command::Buffer(buffer_tx, self.tracer.clone()))
@@ -356,8 +358,9 @@ impl PendingFrame {
 
     /// Like [`PendingFrame::wait`], but gives up with `FlowError::Flushing` soon after `cancel`
     /// is set, so a streaming thread can be unblocked (GstBaseSrc `unlock()`) without waiting
-    /// out the reply timeout.
-    pub fn wait_unless(self, cancel: &AtomicBool) -> Result<gst::Buffer, gst::FlowError> {
+    /// out the reply timeout. Keep the frame after a cancel and wait on it again later: dropping
+    /// it makes the compositor fail to deliver the frame, and it shuts down when that happens.
+    pub fn wait_unless(&self, cancel: &AtomicBool) -> Result<gst::Buffer, gst::FlowError> {
         let deadline = Instant::now() + self.timeout;
         let result = loop {
             if cancel.load(Ordering::Acquire) {

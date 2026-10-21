@@ -25,8 +25,8 @@ use waylanddisplaycore::utils::allocator::{
 #[cfg(feature = "cuda")]
 use waylanddisplaycore::utils::video_info::CUDAParams;
 use waylanddisplaycore::{
-    ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, Sender,
-    WaylandDisplay, channel, utils::device::PCIVendor,
+    ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, PendingFrame,
+    Sender, WaylandDisplay, channel, utils::device::PCIVendor,
 };
 
 pub struct WaylandDisplaySrc {
@@ -39,6 +39,9 @@ pub struct WaylandDisplaySrc {
     // Set by unlock(): create() stops waiting for its frame so GstBaseSrc can join the streaming
     // thread before stop() instead of waiting out the compositor reply timeout.
     flushing: AtomicBool,
+    // A frame whose wait unlock() cut short; the next create() waits on it instead of requesting
+    // another, since dropping it would shut the compositor down.
+    pending_frame: Mutex<Option<PendingFrame>>,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -50,6 +53,7 @@ impl Default for WaylandDisplaySrc {
             settings: Mutex::new(Settings::default()),
             command_tx: Mutex::new(command_tx),
             flushing: AtomicBool::new(false),
+            pending_frame: Mutex::new(None),
         }
     }
 }
@@ -500,6 +504,12 @@ impl ElementImpl for WaylandDisplaySrc {
         &self,
         transition: gst::StateChange,
     ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
+        if transition == gst::StateChange::PausedToPlaying {
+            // GstBaseSrc unlock()s a live source on pause but defers unlock_stop() to the next
+            // create(); a create() still waiting from before the pause would see the stale flag
+            // and return FLUSHING after the streaming task was restarted, stalling it for good.
+            self.flushing.store(false, Ordering::Release);
+        }
         let res = self.parent_change_state(transition);
         match res {
             Ok(gst::StateChangeSuccess::Success) => {
@@ -919,6 +929,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let subscriber = Registry::default().with(GstLayer);
             tracing::subscriber::with_default(subscriber, || drop(state.display));
         }
+        // Only after the display: dropping a frame the compositor still owes makes it exit, and
+        // Drop must still be able to send Quit and join it.
+        self.pending_frame.lock().unwrap().take();
         Ok(())
     }
 
@@ -949,13 +962,21 @@ impl PushSrcImpl for WaylandDisplaySrc {
             if self.flushing.load(Ordering::Acquire) {
                 return Err(gst::FlowError::Flushing);
             }
-            let pending = match self.state.lock().unwrap().as_ref() {
-                Some(state) => state.display.request_frame()?,
-                None => return Err(gst::FlowError::Eos),
+            let stashed = self.pending_frame.lock().unwrap().take();
+            let pending = match stashed {
+                Some(pending) => pending,
+                None => match self.state.lock().unwrap().as_ref() {
+                    Some(state) => state.display.request_frame()?,
+                    None => return Err(gst::FlowError::Eos),
+                },
             };
-            pending
-                .wait_unless(&self.flushing)
-                .map(CreateSuccess::NewBuffer)
+            match pending.wait_unless(&self.flushing) {
+                Err(gst::FlowError::Flushing) => {
+                    *self.pending_frame.lock().unwrap() = Some(pending);
+                    Err(gst::FlowError::Flushing)
+                }
+                frame => frame.map(CreateSuccess::NewBuffer),
+            }
         })
     }
 }
@@ -1670,17 +1691,115 @@ mod tests {
             PushSrcImpl::create(src.imp(), None).err(),
             Some(gst::FlowError::Flushing)
         );
-        // unlock_stop() resumes normal operation: frames are requested again.
+        // unlock_stop() resumes waiting on the same frame: dropping it would make the compositor
+        // fail to deliver it and shut down.
         BaseSrcImpl::unlock_stop(src.imp()).unwrap();
         let creating = src.clone();
-        let create = std::thread::spawn(move || PushSrcImpl::create(creating.imp(), None).err());
-        let second_frame = next_command(&unserviced, |command| {
-            matches!(command, Command::Buffer(..))
-        });
-        drop(second_frame);
-        assert_eq!(create.join().unwrap(), Some(gst::FlowError::Error));
-
-        drop(pending_frame);
+        let create = std::thread::spawn(move || PushSrcImpl::create(creating.imp(), None).is_ok());
+        let Command::Buffer(buffer_tx, _) = pending_frame else {
+            unreachable!()
+        };
+        buffer_tx.send(Ok(gst::Buffer::new())).unwrap();
+        assert!(create.join().unwrap(), "the kept frame was not delivered");
+        assert!(
+            unserviced.try_recv().is_err(),
+            "requested another frame instead of waiting on the kept one"
+        );
         drop_unserviced_display(&src, unserviced, compositor_tx);
+    }
+
+    /// A software-rendered live pipeline whose sink counts the frames it receives.
+    fn counting_pipeline() -> (
+        gst::Pipeline,
+        gst::Element,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use gst::prelude::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .build()
+            .upcast::<gst::Element>();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("width", 320)
+                    .field("height", 240)
+                    .field("framerate", gst::Fraction::new(30, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("signal-handoffs", true)
+            .property("sync", false)
+            .build()
+            .unwrap();
+        let frames = Arc::new(AtomicUsize::new(0));
+        let counter = frames.clone();
+        sink.connect("handoff", false, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &caps, &sink]).unwrap();
+        gst::Element::link_many([&src, &caps, &sink]).unwrap();
+        (pipeline, src, frames)
+    }
+
+    /// Asserts frames keep flowing: the count grows within a few seconds.
+    fn assert_frames_flow(frames: &std::sync::atomic::AtomicUsize, what: &str) {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let start = frames.load(Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frames.load(Ordering::SeqCst) < start + 3 {
+            assert!(Instant::now() < deadline, "no frames after {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // XERK-2103: unlock() on a flush dropped the frame create() was waiting for, the compositor
+    // shut down when it could not deliver it, and the stream died.
+    #[test]
+    fn frames_flow_after_flushes() {
+        use gst::prelude::*;
+        test_init();
+
+        let (pipeline, src, frames) = counting_pipeline();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        assert_frames_flow(&frames, "start");
+        for run in 0..10 {
+            assert!(src.send_event(gst::event::FlushStart::new()));
+            assert!(src.send_event(gst::event::FlushStop::new(true)));
+            assert_frames_flow(&frames, &format!("flush {run}"));
+        }
+        let bus = pipeline.bus().unwrap();
+        assert!(
+            bus.pop_filtered(&[gst::MessageType::Error]).is_none(),
+            "flushing posted an error"
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    // XERK-2103: a live pause unlock()s the source but GstBaseSrc defers unlock_stop(); a quick
+    // resume must not leave the streaming task stopped.
+    #[test]
+    fn frames_flow_after_quick_pause_resume() {
+        use gst::prelude::*;
+        test_init();
+
+        let (pipeline, _src, frames) = counting_pipeline();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        assert_frames_flow(&frames, "start");
+        for run in 0..10 {
+            pipeline.set_state(gst::State::Paused).unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            assert_frames_flow(&frames, &format!("resume {run}"));
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
     }
 }
