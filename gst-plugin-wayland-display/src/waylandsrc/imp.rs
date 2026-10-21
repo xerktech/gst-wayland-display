@@ -39,6 +39,8 @@ pub struct WaylandDisplaySrc {
     // Set by unlock(): create() stops waiting for its frame so GstBaseSrc can join the streaming
     // thread before stop() instead of waiting out the compositor reply timeout.
     flushing: AtomicBool,
+    // Set while change_state() runs PLAYING->PAUSED; see there.
+    pausing: AtomicBool,
     // A frame whose wait unlock() cut short; the next create() waits on it instead of requesting
     // another, since dropping it would shut the compositor down.
     pending_frame: Mutex<Option<PendingFrame>>,
@@ -53,6 +55,7 @@ impl Default for WaylandDisplaySrc {
             settings: Mutex::new(Settings::default()),
             command_tx: Mutex::new(command_tx),
             flushing: AtomicBool::new(false),
+            pausing: AtomicBool::new(false),
             pending_frame: Mutex::new(None),
         }
     }
@@ -504,13 +507,15 @@ impl ElementImpl for WaylandDisplaySrc {
         &self,
         transition: gst::StateChange,
     ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
-        if transition == gst::StateChange::PausedToPlaying {
-            // GstBaseSrc unlock()s a live source on pause but defers unlock_stop() to the next
-            // create(); a create() still waiting from before the pause would see the stale flag
-            // and return FLUSHING after the streaming task was restarted, stalling it for good.
-            self.flushing.store(false, Ordering::Release);
-        }
+        // GstBaseSrc unlock()s a live source on pause, but a create() cancelled by it can return
+        // FLUSHING after a quick resume already restarted the streaming task, which then stops
+        // for good. A pause doesn't join the task, so let unlock() ignore it.
+        let pausing = transition == gst::StateChange::PlayingToPaused;
+        self.pausing.store(pausing, Ordering::Release);
         let res = self.parent_change_state(transition);
+        if pausing {
+            self.pausing.store(false, Ordering::Release);
+        }
         match res {
             Ok(gst::StateChangeSuccess::Success) => {
                 if transition.next() == gst::State::Paused {
@@ -940,7 +945,9 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn unlock(&self) -> Result<(), gst::ErrorMessage> {
-        self.flushing.store(true, Ordering::Release);
+        if !self.pausing.load(Ordering::Acquire) {
+            self.flushing.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1785,8 +1792,8 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
-    // XERK-2103: a live pause unlock()s the source but GstBaseSrc defers unlock_stop(); a quick
-    // resume must not leave the streaming task stopped.
+    // XERK-2103: a create() cancelled by a live pause's unlock() could return FLUSHING after a
+    // quick resume had restarted the streaming task, leaving it stopped for good.
     #[test]
     fn frames_flow_after_quick_pause_resume() {
         use gst::prelude::*;
@@ -1795,7 +1802,7 @@ mod tests {
         let (pipeline, _src, frames) = counting_pipeline();
         pipeline.set_state(gst::State::Playing).unwrap();
         assert_frames_flow(&frames, "start");
-        for run in 0..10 {
+        for run in 0..100 {
             pipeline.set_state(gst::State::Paused).unwrap();
             pipeline.set_state(gst::State::Playing).unwrap();
             assert_frames_flow(&frames, &format!("resume {run}"));
