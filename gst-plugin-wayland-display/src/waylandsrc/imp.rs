@@ -129,7 +129,17 @@ struct VirtualDevice {
 fn input_device_identity(path: &str) -> Option<PathBuf> {
     let node = std::fs::canonicalize(path).ok()?;
     let name = node.file_name()?.to_str()?;
-    std::fs::canonicalize(format!("/sys/class/input/{name}/device")).ok()
+    std::fs::canonicalize(sysfs_root().join("class/input").join(name).join("device")).ok()
+}
+
+#[cfg(not(test))]
+fn sysfs_root() -> PathBuf {
+    PathBuf::from("/sys")
+}
+
+#[cfg(test)]
+fn sysfs_root() -> PathBuf {
+    tests::SYSFS_ROOT.with(|root| root.borrow().clone())
 }
 
 #[derive(Debug, Default)]
@@ -1350,6 +1360,13 @@ mod tests {
     /// Paths the compositor logged as "Adding input device.", across all tests in this binary.
     static ADDED_INPUT_DEVICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+    thread_local! {
+        /// Where input_device_identity() looks devices up. Per thread, as start() and event
+        /// handling run on the test's thread, so a fake tree doesn't leak into other tests.
+        pub(super) static SYSFS_ROOT: std::cell::RefCell<std::path::PathBuf> =
+            std::cell::RefCell::new("/sys".into());
+    }
+
     /// Records the paths of the compositor's "Adding input device." events.
     struct AddedInputDevices;
 
@@ -1640,6 +1657,113 @@ mod tests {
         // Announcing the device that now owns the path keeps it again.
         announce(&reused.path);
         assert_eq!(startup_devices(), [kept.path.clone(), reused.path.clone()]);
+    }
+
+    // XERK-2173: start() re-added every announced path, including unplugged devices and event
+    // numbers since given to another device. Runs without hardware on a fake sysfs tree.
+    #[test]
+    fn restart_skips_virtual_devices_that_are_gone_or_reassigned() {
+        use gst::prelude::*;
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+        test_init();
+
+        let root = std::env::temp_dir().join(format!("xerk2173-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let node = |n: u32| root.join(format!("dev/event{n}"));
+        let link = |n: u32| root.join(format!("sys/class/input/event{n}/device"));
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        for n in 4..=7 {
+            std::fs::write(node(n), "").unwrap();
+            std::fs::create_dir_all(root.join(format!("sys/devices/input{n}"))).unwrap();
+            std::fs::create_dir_all(link(n).parent().unwrap()).unwrap();
+            symlink(root.join(format!("sys/devices/input{n}")), link(n)).unwrap();
+        }
+        SYSFS_ROOT.with(|sysfs| *sysfs.borrow_mut() = root.join("sys"));
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>()
+            .property("render-node", "software")
+            .build()
+            .upcast::<gst::Element>();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+        let path = |n: u32| node(n).to_str().unwrap().to_owned();
+        let adds = |n: u32| {
+            ADDED_INPUT_DEVICES
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|added| **added == path(n))
+                .count()
+        };
+        let wait_for_adds = |n: u32, count: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while adds(n) < count {
+                assert!(Instant::now() < deadline, "event{n} was not added");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        let announce = |path: &str| {
+            assert!(
+                src.send_event(gst::event::CustomUpstream::new(
+                    gst::Structure::builder("VirtualDevicesReady")
+                        .field("path", path)
+                        .build(),
+                ))
+            );
+        };
+        let reassign = |n: u32, to: u32| {
+            std::fs::create_dir_all(root.join(format!("sys/devices/input{to}"))).unwrap();
+            std::fs::remove_file(link(n)).unwrap();
+            symlink(root.join(format!("sys/devices/input{to}")), link(n)).unwrap();
+        };
+        // No sysfs entry, so its identity is unknown: kept, as before.
+        let unknown = root.join("dev/unknown").to_str().unwrap().to_owned();
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        // Unplugged, silently reassigned, reconnected, unknown, kept: added in this order.
+        for n in [6, 4, 7] {
+            announce(&path(n));
+        }
+        announce(&unknown);
+        announce(&path(5));
+        wait_for_adds(5, 1);
+        // event7 reconnects on its old path while streaming and is announced again.
+        reassign(7, 17);
+        announce(&path(7));
+        wait_for_adds(7, 2);
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        std::fs::remove_file(node(6)).unwrap();
+        reassign(4, 14);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        wait_for_adds(5, 2);
+        pipeline.set_state(gst::State::Null).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let unknown_adds = ADDED_INPUT_DEVICES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|added| **added == unknown)
+            .count();
+        assert_eq!(adds(6), 1, "re-added an unplugged device");
+        assert_eq!(
+            adds(4),
+            1,
+            "re-added a path now belonging to another device"
+        );
+        assert_eq!(
+            adds(7),
+            3,
+            "dropped a device announced again on its old path"
+        );
+        assert_eq!(
+            unknown_adds, 2,
+            "dropped a device whose identity was unknown"
+        );
     }
 
     // create() must not hold the state lock while it waits for the frame, or caps queries
