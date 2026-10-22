@@ -64,7 +64,7 @@ use smithay::{
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::CString,
     sync::{Arc, mpsc::Sender},
     time::{Duration, Instant},
@@ -133,6 +133,8 @@ pub struct State {
     /// initial configure (and move to `pending_windows`) once `apply_video_info` runs.
     pub windows_awaiting_output: Vec<Window>,
     input_context: Libinput,
+    /// libinput handle of each device added by path, so a re-announced path replaces its handle.
+    input_devices: HashMap<String, smithay::reexports::input::Device>,
 
     // wayland state
     pub dh: DisplayHandle,
@@ -292,6 +294,7 @@ impl State {
             pending_windows: Vec::new(),
             windows_awaiting_output: Vec::new(),
             input_context: input_context.clone(),
+            input_devices: HashMap::new(),
 
             dh: dh.clone(),
             compositor_state,
@@ -495,7 +498,7 @@ pub(crate) fn init(
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
-                    state.input_context.path_add_device(&path);
+                    state.add_input_device(&path);
                 }
                 Event::Msg(Command::Buffer(buffer_sender, tracer)) => {
                     let wait = if let Some(last_render) = state.last_render {

@@ -11,6 +11,7 @@ use gst_base::subclass::prelude::*;
 use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, VideoInfoDmaDrm};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -89,18 +90,54 @@ impl Settings {
     fn startup_input_devices(&self) -> Vec<String> {
         self.input_devices
             .iter()
-            .chain(&self.virtual_input_devices)
             .cloned()
+            .chain(
+                self.virtual_input_devices
+                    .iter()
+                    .map(|device| device.path.clone()),
+            )
             .collect()
     }
+
+    /// Forgets announced devices that are gone or whose path now belongs to another device, so
+    /// start() doesn't hand the display an input it was never given.
+    fn prune_virtual_input_devices(&mut self) {
+        self.virtual_input_devices.retain(|device| {
+            let unchanged =
+                device.identity.is_none() || input_device_identity(&device.path) == device.identity;
+            if !unchanged {
+                tracing::info!(
+                    path = device.path,
+                    "Dropping a virtual input device that is gone."
+                );
+            }
+            unchanged
+        });
+    }
+}
+
+/// A device announced with VirtualDevicesReady.
+#[derive(Debug)]
+struct VirtualDevice {
+    path: String,
+    /// What the path pointed at when announced; None if it couldn't be told, which keeps it.
+    identity: Option<PathBuf>,
+}
+
+/// The kernel input device behind an evdev node: its sysfs `inputN` directory. Unlike
+/// /dev/input/eventN numbers, `inputN` numbers are never handed out twice.
+fn input_device_identity(path: &str) -> Option<PathBuf> {
+    let node = std::fs::canonicalize(path).ok()?;
+    let name = node.file_name()?.to_str()?;
+    std::fs::canonicalize(format!("/sys/class/input/{name}/device")).ok()
 }
 
 #[derive(Debug, Default)]
 pub struct Settings {
     render_node: Option<String>,
     input_devices: Vec<String>,
-    // Devices announced with VirtualDevicesReady; re-added on every start().
-    virtual_input_devices: Vec<String>,
+    // Devices announced with VirtualDevicesReady; re-added on every start() while unchanged.
+    virtual_input_devices: Vec<VirtualDevice>,
     disable_intel_workaround: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
@@ -139,8 +176,17 @@ impl EventHandler for WaylandDisplaySrc {
                     // channel: the path is either in start()'s snapshot or sent to the new display.
                     let mut settings = self.settings.lock().unwrap();
                     // Always forward: a reconnected device can reuse its old /dev/input path.
-                    if !settings.virtual_input_devices.contains(&path) {
-                        settings.virtual_input_devices.push(path.clone());
+                    let identity = input_device_identity(&path);
+                    match settings
+                        .virtual_input_devices
+                        .iter_mut()
+                        .find(|device| device.path == path)
+                    {
+                        Some(device) => device.identity = identity,
+                        None => settings.virtual_input_devices.push(VirtualDevice {
+                            path: path.clone(),
+                            identity,
+                        }),
                     }
                     self.send_command(Command::InputDevice(path));
                     return true;
@@ -847,7 +893,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // The channel is swapped under the settings lock so a concurrent VirtualDevicesReady lands
         // either in the queued startup devices or after them, never both or neither.
         let (render_node, command_rx, command_tx) = {
-            let settings = self.settings.lock().unwrap();
+            let mut settings = self.settings.lock().unwrap();
+            settings.prune_virtual_input_devices();
             let command_rx = self.new_startup_channel(&settings);
             let command_tx = self.command_tx.lock().unwrap().clone();
             (settings.render_node.clone(), command_rx, command_tx)
@@ -1539,6 +1586,60 @@ mod tests {
             imp.settings.lock().unwrap().startup_input_devices(),
             ["/dev/input/event7"]
         );
+    }
+
+    // XERK-2173: start() re-added every announced path, including unplugged devices and event
+    // numbers the kernel had since given to another device.
+    #[test]
+    #[ignore = "needs /dev/uinput and udev; run with --ignored"]
+    fn restart_drops_virtual_devices_that_changed() {
+        use super::EventHandler;
+        use gst::subclass::prelude::*;
+        use waylanddisplaycore::utils::uinput::UinputKeyboard;
+        test_init();
+
+        let src = gst::glib::Object::builder::<super::super::WaylandDisplaySrc>().build();
+        let imp = src.imp();
+        let _command_rx = imp.new_command_channel();
+        let announce = |path: &str| {
+            assert!(
+                imp.handle_event(&gst::event::CustomUpstream::new(
+                    gst::Structure::builder("VirtualDevicesReady")
+                        .field("path", path)
+                        .build(),
+                ))
+            );
+        };
+        let startup_devices = || {
+            let mut settings = imp.settings.lock().unwrap();
+            settings.prune_virtual_input_devices();
+            settings.startup_input_devices()
+        };
+
+        let kept = UinputKeyboard::new();
+        let unplugged = UinputKeyboard::new();
+        let unplugged_path = unplugged.path.clone();
+        announce(&kept.path);
+        announce(&unplugged_path);
+        drop(unplugged);
+        assert_eq!(startup_devices(), [kept.path.clone()]);
+
+        // The kernel hands out the lowest free event number, so this takes the dropped one.
+        let other = UinputKeyboard::new();
+        announce(&other.path);
+        drop(other);
+        let reused = UinputKeyboard::new();
+        assert_eq!(
+            startup_devices(),
+            [kept.path.clone()],
+            "re-added {} (now another device: {})",
+            reused.path,
+            reused.path == unplugged_path
+        );
+
+        // Announcing the device that now owns the path keeps it again.
+        announce(&reused.path);
+        assert_eq!(startup_devices(), [kept.path.clone(), reused.path.clone()]);
     }
 
     // create() must not hold the state lock while it waits for the frame, or caps queries

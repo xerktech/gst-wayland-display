@@ -15,6 +15,8 @@ path = "src/lib.rs"
 [features]
 default = []
 cuda = ["dep:libloading"]
+# Virtual uinput devices for other crates' hardware-gated tests.
+test-uinput = ["dep:libc"]
 
 [dependencies]
 gst.workspace = true
@@ -26,11 +28,13 @@ wayland-server = { version = "0.31.13", features = ["libwayland_1_23"] }
 wayland-scanner = "0.31.10"
 gstreamer-allocators = { version = "0.23.2", package = "gstreamer-allocators", features = ["v1_24", "v1_16"] }
 libloading = { version = "0.8.9", optional = true }
+libc = { version = "0.2", optional = true }
 
 [build-dependencies]
 pkg-config = "0.3"
 
 [dev-dependencies]
+libc = "0.2"
 tracing-subscriber = "0.3.18"
 wayland-client = "0.31.10"
 wayland-protocols = { version = "0.32.8", features = ["client"] }

@@ -4,6 +4,8 @@ pub mod renderer;
 pub mod video_info;
 
 mod target;
+#[cfg(any(test, feature = "test-uinput"))]
+pub mod uinput;
 
 pub use self::target::*;
 
