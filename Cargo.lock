@@ -1817,6 +1817,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-allocators",
  "gstreamer-video",
+ "libc",
  "libloading",
  "once_cell",
  "pkg-config",
